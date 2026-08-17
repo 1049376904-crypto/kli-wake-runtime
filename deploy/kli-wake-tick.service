@@ -1,0 +1,37 @@
+[Unit]
+Description=Kli Wake Runtime tick (advance activation state one grid step)
+Documentation=https://github.com/1049376904-crypto/kli-wake-runtime
+# 形态 B：没有常驻进程。真正的节律活在 SQLite 里，这个单元只是给它推进的机会。
+# 漏跑几分钟不要紧，下一次 tick 会按整分钟网格补齐（≤ max_gap 时累积 hazard）。
+
+[Service]
+Type=oneshot
+
+# 改成你自己的用户和路径。不要用 root 跑——这东西不需要任何特权。
+User=kli
+Group=kli
+WorkingDirectory=/opt/kli-wake-runtime
+Environment=KLI_WAKE_DB=/var/lib/kli-wake/kli_wake.db
+ExecStart=/usr/bin/python3 -m wake.tick -q
+
+# 拿不到进程锁时 tick 会直接退 0，不需要 systemd 重试。
+TimeoutStartSec=60
+
+# 最小权限：只能写数据库目录，别的都只读。
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/kli-wake
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# 阶段 2 不需要网络。接外部 Source 之前保持这行。
+PrivateNetwork=yes
+
+[Install]
+WantedBy=multi-user.target

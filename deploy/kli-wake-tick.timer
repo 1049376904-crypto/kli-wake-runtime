@@ -1,0 +1,18 @@
+[Unit]
+Description=Run Kli Wake Runtime tick every minute
+Documentation=https://github.com/1049376904-crypto/kli-wake-runtime
+
+[Timer]
+# 对齐到整分钟。引擎的时间网格就是 UTC epoch 整分钟，对齐能减少跳格。
+OnCalendar=*:*:00
+AccuracySec=1s
+
+# 开机后先跑一次，让长间隔恢复早点发生（不补发，只重锚并重抽 cycle）。
+OnBootSec=30s
+
+# 默认不开 Persistent：停机期间错过的 tick 不需要补。
+# 自发 Wake 是机会，不是欠账。
+Persistent=false
+
+[Install]
+WantedBy=timers.target
