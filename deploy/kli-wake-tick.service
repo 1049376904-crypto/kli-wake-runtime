@@ -8,11 +8,14 @@ Documentation=https://github.com/1049376904-crypto/kli-wake-runtime
 Type=oneshot
 
 # 改成你自己的用户和路径。不要用 root 跑——这东西不需要任何特权。
+# 先确认两个目录都存在，否则 ReadWritePaths 指向不存在的路径，
+# systemd 连命名空间都搭不起来（status=226/NAMESPACE）。
 User=kli
 Group=kli
 WorkingDirectory=/opt/kli-wake-runtime
 Environment=KLI_WAKE_DB=/var/lib/kli-wake/kli_wake.db
-ExecStart=/usr/bin/python3 -m wake.tick -q
+# 显式写出子命令：-q 定义在 tick 上，不写 tick 靠的是 argv 归一化兜底。
+ExecStart=/usr/bin/python3 -m wake.tick tick -q
 
 # 拿不到进程锁时 tick 会直接退 0，不需要 systemd 重试。
 TimeoutStartSec=60

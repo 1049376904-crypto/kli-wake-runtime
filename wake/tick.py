@@ -56,6 +56,8 @@ from .storage import (
 # 快照保留天数。每分钟一行，90 天约 13 万行，几 MB，无所谓。
 SNAPSHOT_RETENTION_DAYS = 90
 
+SUBCOMMANDS = ("tick", "status", "report-run", "export")
+
 
 def _mmod_now() -> float:
     """当前的主观调制因子。
@@ -107,9 +109,7 @@ def run_tick(
             # 都会看到 None，后一个不能覆盖前一个。
             if seed is None:
                 seed = int.from_bytes(os.urandom(8), "big")
-            candidate = init_state(
-                target_minute, policy, seed=seed, cold_start=True
-            )
+            candidate = init_state(target_minute, policy, seed=seed, cold_start=True)
             state, created = ensure_state(conn, candidate)
             if created:
                 insert_event(
@@ -370,6 +370,30 @@ def _cmd_export(args) -> int:
     return 0
 
 
+def _normalize_argv(argv: list[str]) -> list[str]:
+    """不带子命令时默认 tick，方便 cron 写 `python3 -m wake.tick -q`。
+
+    必须在 parse_args 之前插：-q / --minute / --seed 都定义在 tick 子命令上，
+    顶层 parser 不认识它们，会直接 exit(2)（这次真把 systemd 坑了）。
+    先解析再看 hasattr(args, "func") 兵底是没用的，因为根本轮不到。
+    """
+    if any(a in SUBCOMMANDS for a in argv):
+        return list(argv)
+    out = list(argv)
+    # 跳过顶层 --db 及其取值，把 tick 插在子命令位置上
+    i = 0
+    while i < len(out):
+        if out[i] == "--db" and i + 1 < len(out):
+            i += 2
+            continue
+        if out[i].startswith("--db="):
+            i += 1
+            continue
+        break
+    out.insert(i, "tick")
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Kli Wake Runtime tick（形态 B：无常驻进程）"
@@ -400,12 +424,10 @@ def main(argv: list[str] | None = None) -> int:
     p_exp.add_argument("--days", type=float, default=7.0)
     p_exp.set_defaults(func=_cmd_export)
 
-    args = ap.parse_args(argv)
-    if not hasattr(args, "func"):
-        # 不带子命令时默认 tick，方便 cron 直接写 `python3 -m wake.tick -q`
-        args = ap.parse_args((argv or []) + ["tick"])
+    raw = sys.argv[1:] if argv is None else list(argv)
+    args = ap.parse_args(_normalize_argv(raw))
 
-    # status / export 是只读的，不抢锁；写路径必须拿锁。
+    # status / export 是只读的，不报锁；写路径必须拿锁。
     if args.func in (_cmd_status, _cmd_export):
         return args.func(args)
 
