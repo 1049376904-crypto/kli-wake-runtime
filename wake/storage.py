@@ -6,7 +6,7 @@
 这样做的好处是不存在"进程活着但卡住了"这类状态：cron 漏跑、机器重启、
 手动 stop，全部走同一条恢复路径，而这条路径已经有测试覆盖。
 
-代价是跮了 monotonic clock：进程每分钟重建，monotonic 计数器跟着残废，
+代价是丢了 monotonic clock：进程每分钟重建，monotonic 计数器跟着残废，
 跳不过进程边界。所以 dt 只能靠 wall clock 算，时钟回拨的防护只剩一层：
 engine.advance() 拒绝往回走，并记 clock_regression。NTP 小幅矫正不会出问题，
 手动把系统时间往前拨大步会被当成长间隔恢复（不补发，cycle 作废）。
@@ -22,7 +22,6 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from typing import Iterator
 
 from .engine import ActivationState, WakeEvent, minute_to_epoch_seconds
@@ -101,7 +100,7 @@ CREATE TABLE IF NOT EXISTS wake_opportunities (
 CREATE INDEX IF NOT EXISTS idx_opp_status ON wake_opportunities(status, created_minute);
 
 -- 事件日志：suppressed_spontaneous / clock_regression / catchup_truncated /
--- agent_run / init 等。出问题时靠它回溯。
+-- agent_run / activation_initialized 等。出问题时靠它回溯。
 CREATE TABLE IF NOT EXISTS wake_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     kind       TEXT    NOT NULL,
@@ -159,12 +158,6 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[None]:
 # 进程锁
 # --------------------------------------------------------------------------
 
-@dataclass
-class _Lock:
-    fd: int
-    path: str
-
-
 @contextmanager
 def process_lock(db_path: str = DEFAULT_DB_PATH) -> Iterator[None]:
     """非阻塞文件锁，防两个 tick 进程重叠。
@@ -175,7 +168,9 @@ def process_lock(db_path: str = DEFAULT_DB_PATH) -> Iterator[None]:
     import fcntl
 
     lock_path = os.path.abspath(db_path) + ".lock"
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    directory = os.path.dirname(lock_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         try:
@@ -214,9 +209,7 @@ _STATE_COLUMNS = (
 
 
 def load_state(conn: sqlite3.Connection) -> ActivationState | None:
-    row = conn.execute(
-        "SELECT * FROM activation_state WHERE id = 1"
-    ).fetchone()
+    row = conn.execute("SELECT * FROM activation_state WHERE id = 1").fetchone()
     if row is None:
         return None
     payload = {k: row[k] for k in _STATE_COLUMNS}
@@ -247,16 +240,41 @@ def _state_row(state: ActivationState) -> tuple:
     )
 
 
-def insert_state(conn: sqlite3.Connection, state: ActivationState) -> None:
-    """首次初始化。已存在则抛 IntegrityError（这是正确行为：绝不重新初始化）。"""
-    conn.execute(
-        "INSERT INTO activation_state (id, "
+def insert_state(conn: sqlite3.Connection, state: ActivationState) -> bool:
+    """首次初始化。已存在则返回 False 且不改动任何东西。
+
+    用 INSERT OR IGNORE 而不是让 IntegrityError 冒出来：两个 tick 进程同时
+    首次启动是真实场景（timer + 手动敲），而 IntegrityError 会污染事务，
+    让同一事务里后续的 INSERT 全部失败。
+    """
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO activation_state (id, "
         + ", ".join(_STATE_COLUMNS)
         + ", updated_at) VALUES (1, "
         + ", ".join("?" * (len(_STATE_COLUMNS) + 1))
         + ")",
         _state_row(state),
     )
+    return cur.rowcount == 1
+
+
+def ensure_state(
+    conn: sqlite3.Connection, candidate: ActivationState
+) -> tuple[ActivationState, bool]:
+    """要么写入 candidate，要么返回已存在的状态。返回 (权威状态, 是否新建)。
+
+    这是首次启动的唯一正确入口。绝不能写成"先 load 看看有没有，没有就 insert"——
+    两个进程都会看到 None，然后后一个覆盖前一个，节律被重抽一次。
+
+    调用方必须在 write_transaction 里调，BEGIN IMMEDIATE 已经拿了写锁，
+    这里的 INSERT OR IGNORE 只是再加一道数据库级保证。
+    """
+    created = insert_state(conn, candidate)
+    if created:
+        return candidate, True
+    existing = load_state(conn)
+    assert existing is not None, "INSERT 被忽略但又读不到状态，不应该发生"
+    return existing, False
 
 
 def save_state(
@@ -279,7 +297,7 @@ def save_state(
 # 机会 / 事件 / 快照
 # --------------------------------------------------------------------------
 
-# 机会失效时长。这是 Dispatcher 层的关切（“这次机会还新鲜吗”），不是策略参数，
+# 机会失效时长。这是 Dispatcher 层的关切（"这次机会还新鲜吗"），不是策略参数，
 # 所以不放进 WakePolicy——否则会白白改变 policy fingerprint。
 OPPORTUNITY_TTL_MINUTES = 10
 
