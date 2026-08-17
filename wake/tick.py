@@ -18,15 +18,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
-import random
 import sqlite3
 import sys
 import time
 
 from .engine import (
-    ActivationState,
     advance,
     diagnostics,
     epoch_minute,
@@ -41,14 +38,15 @@ from .storage import (
     connect,
     counts,
     ensure_schema,
+    ensure_state,
     expire_stale_opportunities,
     insert_event,
     insert_opportunity,
     insert_snapshot,
-    insert_state,
     insert_wake_event,
     load_state,
     minute_to_iso,
+    opportunity_id,
     process_lock,
     prune_snapshots,
     save_state,
@@ -67,6 +65,15 @@ def _mmod_now() -> float:
     注意它只能调制 λ，不能直接 wake_now。
     """
     return 1.0
+
+
+def _opp_id_for(event) -> str:
+    """从 cycle_id 尾部取 seq，凑出确定性的机会 id。
+
+    cycle_id 形如 cyc_{minute:09d}_{seq:06d}，见 engine._cycle_id()。
+    """
+    seq = int(event.cycle_id.rsplit("_", 1)[-1])
+    return opportunity_id(event.minute, seq)
 
 
 def run_tick(
@@ -96,29 +103,35 @@ def run_tick(
 
         if state is None:
             # 只在完全没有状态时初始化。重启读旧状态，绝不重新抽节律。
+            # 走 ensure_state 而不是裸 insert：两个进程同时首次启动时
+            # 都会看到 None，后一个不能覆盖前一个。
             if seed is None:
                 seed = int.from_bytes(os.urandom(8), "big")
-            state = init_state(target_minute, policy, seed=seed, cold_start=True)
-            insert_state(conn, state)
-            insert_event(
-                conn,
-                "activation_initialized",
-                target_minute,
-                state.cycle_id,
-                {
-                    "policy_version": policy.version,
-                    "policy_fingerprint": policy.fingerprint(),
-                    "seed": str(seed),
-                    "cold_start": True,
-                    "warmup_minutes": policy.warmup_minutes,
-                },
+            candidate = init_state(
+                target_minute, policy, seed=seed, cold_start=True
             )
-            insert_snapshot(
-                conn, state, lambda_of_state(state, policy, m), m, wake=False
-            )
-            summary["initialized"] = True
-            summary["state"] = diagnostics(state, policy, m)
-            return summary
+            state, created = ensure_state(conn, candidate)
+            if created:
+                insert_event(
+                    conn,
+                    "activation_initialized",
+                    target_minute,
+                    state.cycle_id,
+                    {
+                        "policy_version": policy.version,
+                        "policy_fingerprint": policy.fingerprint(),
+                        "seed": str(seed),
+                        "cold_start": True,
+                        "warmup_minutes": policy.warmup_minutes,
+                    },
+                )
+                insert_snapshot(
+                    conn, state, lambda_of_state(state, policy, m), m, wake=False
+                )
+                summary["initialized"] = True
+                summary["state"] = diagnostics(state, policy, m)
+                return summary
+            # 竞态输了：另一个进程刚建好状态。用它的状态继续走正常路径。
 
         expected_version = state.state_version
         nxt, events = advance(state, target_minute, policy, m)
@@ -163,13 +176,6 @@ def run_tick(
         summary["state"] = diagnostics(nxt, policy, m)
 
     return summary
-
-
-def _opp_id_for(event) -> str:
-    from .storage import opportunity_id
-
-    seq = int(event.cycle_id.rsplit("_", 1)[-1])
-    return opportunity_id(event.minute, seq)
 
 
 def do_report_run(
@@ -268,7 +274,7 @@ def _cmd_status(args) -> int:
     print(f"policy            {dg['policy_version']}")
     print(
         f"lastEvaluatedAt   {dg['minute']}  ({minute_to_iso(dg['minute'])})  "
-        f"转后 {now - dg['minute']} 分钟"
+        f"距今 {now - dg['minute']} 分钟"
     )
     print(
         f"D / T / X         {dg['drive']:.3f} / {dg['tone']:.3f} / {dg['drift']:+.3f}"
@@ -277,9 +283,7 @@ def _cmd_status(args) -> int:
         f"λ(t)              {dg['lambda_per_hour']:.2f}/h     "
         f"H/Θ {dg['hazard']:.3f} / {dg['theta']:.3f}（还差 {dg['hazard_remaining']:.3f}）"
     )
-    print(
-        f"cycle             {dg['cycle_id']}  已持续 {dg['cycle_age_minutes']} 分钟"
-    )
+    print(f"cycle             {dg['cycle_id']}  已持续 {dg['cycle_age_minutes']} 分钟")
     print(
         f"warmup            {'complete' if dg['warmup_complete'] else 'active'}     "
         f"stateVersion {dg['state_version']}     AgentRun 累计 {dg['runs_total']}"
@@ -294,7 +298,7 @@ def _cmd_status(args) -> int:
     )
     if now - dg["minute"] > DEFAULT_POLICY.max_gap_minutes:
         print(
-            f"\n注意：转后超过 {DEFAULT_POLICY.max_gap_minutes} 分钟，下次 tick 会走长间隔恢复"
+            f"\n注意：距今超过 {DEFAULT_POLICY.max_gap_minutes} 分钟，下次 tick 会走长间隔恢复"
             "（状态照常演化，hazard 丢弃，cycle 重抽，不补发）。"
         )
     return 0
