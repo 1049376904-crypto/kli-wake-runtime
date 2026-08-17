@@ -5,16 +5,19 @@
 
 用法：
 
-    python -m wake.simulate --days 30 --seed 7
-    python -m wake.simulate --days 30 --user-turns-per-day 12 --silent-rate 0.7
-    python -m wake.simulate --days 30 --csv /tmp/wake.csv
-    python -m wake.simulate --days 14 --sweep lambda_base_per_hour=1.2,1.5,1.8
-    python -m wake.simulate --days 14 --sweep k_run=0.06,0.10,0.14
+    python3 -m wake.simulate --days 30 --seed 7
+    python3 -m wake.simulate --days 30 --user-turns-per-day 12 --silent-rate 0.7
+    python3 -m wake.simulate --days 30 --csv /tmp/wake.csv
+    python3 -m wake.simulate --days 14 --sweep lambda_base_per_hour=1.2,1.5,1.8
+    python3 -m wake.simulate --days 14 --sweep k_run=0.06,0.10,0.14
 
 注意输出里的两组数字含义完全不同：
   - wake 密度 = 引擎给了多少次"运行机会"
   - 感知密度 = 用户实际会看到几条消息（叠加假设 silent rate 和表达预算硬闸）
 第二组才是体验。第一组高不一定吵。
+
+sweep 不会自动带上 --user-turns-per-day，要对比真实场景得显式加，
+否则是零 UserTurn 场景，少了 kick D，wake 密度会偏高。
 """
 
 from __future__ import annotations
@@ -64,20 +67,29 @@ class SimResult:
 
 
 class ExpressionBudget:
-    """滚动窗口配额。超限时把 outcome 强制改写为 silent，并记 budget_suppressed。"""
+    """滚动窗口配额。超限时把 outcome 强制改写为 silent，并记 budget_suppressed。
 
-    def __init__(self, per_hour: int, per_day: int) -> None:
+    单一账本，日上限随 warm-up 状态变化但历史共享。
+
+    不要为 warm-up 期和正常期各开一个账本：切换那一刻新账本从零开始，
+    滚动 24 小时窗口内就能放过 warmup_per_day + per_day 条，
+    单日峰值会超过标称闸门（实测跑出过 9、10 条，闸门写的是 8）。
+    """
+
+    def __init__(self, per_hour: int, per_day: int, per_day_warmup: int) -> None:
         self.per_hour = per_hour
         self.per_day = per_day
+        self.per_day_warmup = per_day_warmup
         self._recent: deque[int] = deque()
 
-    def allow(self, minute: int) -> bool:
+    def allow(self, minute: int, warmup_complete: bool) -> bool:
         while self._recent and minute - self._recent[0] >= 1440:
             self._recent.popleft()
         in_hour = sum(1 for m in self._recent if minute - m < 60)
         if in_hour >= self.per_hour:
             return False
-        if len(self._recent) >= self.per_day:
+        day_cap = self.per_day if warmup_complete else self.per_day_warmup
+        if len(self._recent) >= day_cap:
             return False
         self._recent.append(minute)
         return True
@@ -104,8 +116,9 @@ def simulate(
     # 这样改 silent_rate 不会改变 D/T/X 的轨迹，参数对比才有意义。
     scenario = random.Random(seed * 2654435761 % (2**31))
 
-    budget_warm = ExpressionBudget(EXTERNAL_PER_HOUR, EXTERNAL_PER_DAY_WARMUP)
-    budget_full = ExpressionBudget(EXTERNAL_PER_HOUR, EXTERNAL_PER_DAY)
+    budget = ExpressionBudget(
+        EXTERNAL_PER_HOUR, EXTERNAL_PER_DAY, EXTERNAL_PER_DAY_WARMUP
+    )
 
     wake_minutes: list[int] = []
     user_turn_minutes: list[int] = []
@@ -154,8 +167,7 @@ def simulate(
                 # Agency Gate 的粗糙代理：以 1-silent_rate 的概率想表达。
                 # 真实系统里这是模型的结构化决策，不是抛硬币；这里只为估感知密度。
                 if _wants_external(scenario, silent_rate):
-                    b = budget_full if state.warmup_complete else budget_warm
-                    if b.allow(m):
+                    if budget.allow(m, state.warmup_complete):
                         expressed = True
                         expressed_minutes.append(m)
                     else:
@@ -224,6 +236,21 @@ def _max_per_window(minutes: list[int], window: int) -> int:
     return best
 
 
+def _tone_edge_ratio(tone_samples: list[float], policy: WakePolicy) -> float:
+    """T 贴边时长占比。
+
+    clamp 会把慢状态的分布削平：贴边太久，"这一阵偏活跃"就变成"这一阵卡在最活跃"。
+    只看 T 区间看不出来这件事，因为 30 天里碰一次边区间就写满了。
+    """
+    if not tone_samples:
+        return 0.0
+    eps = 1e-9
+    hits = sum(
+        1 for t in tone_samples if t <= policy.t_min + eps or t >= policy.t_max - eps
+    )
+    return hits / len(tone_samples)
+
+
 def report(r: SimResult) -> None:
     p = r.policy
     iv = _intervals(r.wake_minutes)
@@ -256,7 +283,8 @@ def report(r: SimResult) -> None:
     )
     print(
         f"  D                 中位 {statistics.median(r.drive_samples):.3f}   "
-        f"T 区间 [{min(r.tone_samples):.3f}, {max(r.tone_samples):.3f}]"
+        f"T 区间 [{min(r.tone_samples):.3f}, {max(r.tone_samples):.3f}]  "
+        f"贴边 {_tone_edge_ratio(r.tone_samples, p):.1%}"
     )
     if r.user_turn_minutes:
         print(f"  UserTurn          {len(r.user_turn_minutes)} 次（也 kick D）")
@@ -337,6 +365,12 @@ def main(argv: list[str] | None = None) -> int:
         key, raw_values = args.sweep.split("=", 1)
         if not hasattr(policy, key):
             ap.error(f"未知策略参数 {key!r}")
+        turns = args.user_turns_per_day
+        note = "  ← 零 UserTurn，少了 kick D，wake 密度会偏高" if turns == 0 else ""
+        print(
+            f"（{args.days:g} 天，silent_rate={args.silent_rate:g}，"
+            f"UserTurn={turns:g}/天{note}）"
+        )
         print(f"{key:>22}  wake/天  中位间隔  表达/天  单日峰值  预算拦下")
         print("-" * 74)
         for raw in raw_values.split(","):
